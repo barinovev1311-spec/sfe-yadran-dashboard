@@ -233,7 +233,7 @@ footer.credit{margin-top:30px; color:var(--muted-2); font-size:11px}
       <button class="tab-btn" data-tab="whitespace"><span class="n">6</span>Слепые зоны</button>
       <button class="tab-btn" data-tab="regions"><span class="n">7</span>Сравнение регионов</button>
     </nav>
-    <div class="sidebar-foot">Перепись «Ядран», 1кв. 2026 · 86 227 точек · 90 регионов</div>
+    <div class="sidebar-foot">Перепись «Ядран», 1кв. 2026 · 86 227 точек · 90 регионов<br><span id="buildStamp" style="opacity:.7"></span></div>
   </aside>
 
   <main class="main" id="main">
@@ -256,7 +256,7 @@ const state = {
   sort: {key:'score', dir:-1},
   filter: {q:'', tiers:new Set(['A','B','C','D']), onlyTarget:false},
   mp: {loaded:false, points:[], reps:[], bricks:[], managers:[], company:null, selected:null,
-       filterBrick:'', filterMgr:'', compareMode:'mp', rankQ:''},
+       filterBrick:'', filterMgr:'', compareMode:'mp', rankQ:'', teamAnalysisMgr:null},
 };
 
 const TIER_COLOR = {A:'var(--a)', B:'var(--b)', C:'var(--c)', D:'var(--d)'};
@@ -302,7 +302,10 @@ function showFatalError(err){
     </div>`;
 }
 
+const BUILD_STAMP = 'build 2026-08-12 10:15 · v7-efficiency-metrics';
+
 async function boot(){
+  document.getElementById('buildStamp').textContent = BUILD_STAMP;
   let idx, meta;
   try{
     [idx, meta] = await Promise.all([fetchJson('data/_index.json'), fetchJson('data/_meta.json')]);
@@ -736,6 +739,130 @@ function renderComparisonTable(mode, filteredRows, rep){
     </table></div></div>`;
 }
 
+function mgrInsights(mgr, teamReps, company, allManagers){
+  const notes = [];
+  const totalMgrs = allManagers.filter(m=>m.ratingPlace!=null).length;
+  if(mgr.ratingPlace!=null){
+    notes.push({t: mgr.ratingPlace<=Math.ceil(totalMgrs/3)?'ok':mgr.ratingPlace>Math.ceil(totalMgrs*2/3)?'warn':'info',
+      txt:`Команда на ${mgr.ratingPlace}-м месте из ${totalMgrs} по среднему рейтингу (${mgr.avgRating ?? '—'} из 100).`});
+  }
+  if(mgr.avgVisitRate!=null && company.avgVisitRate!=null){
+    const diff=(mgr.avgVisitRate-company.avgVisitRate).toFixed(1);
+    if(mgr.avgVisitRate < company.avgVisitRate - 3){
+      notes.push({t:'warn', txt:`Средний % выполнения плана визитов по команде ${mgr.avgVisitRate}% — ниже среднего по компании (${company.avgVisitRate}%) на ${Math.abs(diff)} п.п.`});
+    } else {
+      notes.push({t:'ok', txt:`Средний % выполнения плана визитов по команде ${mgr.avgVisitRate}% — на уровне или выше среднего по компании (${company.avgVisitRate}%).`});
+    }
+  }
+  if(mgr.avgGrowthPct!=null && company.avgGrowthPct!=null){
+    const diff=(mgr.avgGrowthPct-company.avgGrowthPct).toFixed(1);
+    notes.push({t: mgr.avgGrowthPct>=company.avgGrowthPct?'ok':'warn',
+      txt:`Средняя динамика продаж Q1→Q2 по команде ${mgr.avgGrowthPct>0?'+':''}${mgr.avgGrowthPct}% — ${mgr.avgGrowthPct>=company.avgGrowthPct?'лучше':'хуже'} среднего по компании (${company.avgGrowthPct}%) на ${Math.abs(diff)} п.п.`});
+  }
+  if(teamReps.length>=2){
+    const sorted = [...teamReps].filter(r=>r.rating!=null).sort((a,b)=>b.rating-a.rating);
+    if(sorted.length>=2){
+      const top=sorted[0], bottom=sorted[sorted.length-1];
+      notes.push({t:'info', txt:`Внутри команды разброс рейтинга от ${bottom.rating} (${bottom.mp}) до ${top.rating} (${top.mp}) — разница ${(top.rating-bottom.rating).toFixed(1)} балла. ${(top.rating-bottom.rating)>25?'Большой разрыв: стоит разобраться, чем топ-МП отличается в подходе, и подтянуть отстающего.':''}`});
+    }
+  }
+  const whitespaceTotal = teamReps.reduce((s,r)=>s+(r.highPotNotTargeted||0),0);
+  if(whitespaceTotal>0){
+    notes.push({t:'warn', txt:`Суммарно по команде ${whitespaceTotal} точек с высоким потенциалом не входят в целевой список — потенциал для пересмотра планов визитов.`});
+  }
+  const missedTotal = teamReps.reduce((s,r)=>s+(r.missedVisit||0),0);
+  if(missedTotal>0){
+    notes.push({t:'warn', txt:`${missedTotal} целевых визитов по команде не выполнено в Q1 (суммарно по всем МП команды).`});
+  }
+  return notes;
+}
+
+function renderTeamConclusions(rep){
+  const {reps, managers} = state.mp;
+  const mgrSelected = state.mp.teamAnalysisMgr || rep.mgr;
+  const mgrList = ruSort([...new Set(reps.map(r=>r.mgr).filter(Boolean))]);
+  const mgrObj = managers.find(m=>m.mgr===mgrSelected);
+  if(!mgrObj) return '<div class="hint">Нет данных по руководителям.</div>';
+  const teamReps = reps.filter(r=>r.mgr===mgrSelected).sort((a,b)=>(a.ratingPlace??999)-(b.ratingPlace??999));
+  const notes = mgrInsights(mgrObj, teamReps, state.mp.company, managers);
+  const noteColor = {warn:'var(--amber)', ok:'var(--a)', info:'var(--b)'};
+  const noteBg = {warn:'var(--amber-tint)', ok:'var(--a-tint)', info:'var(--b-tint)'};
+
+  return `
+  <div class="card">
+    <div class="filters" style="margin-bottom:14px">
+      <label style="font-size:12.5px;color:var(--muted);font-weight:600">Команда руководителя:</label>
+      <select id="teamMgrSel" style="width:260px">${mgrList.map(m=>`<option value="${m}" ${m===mgrSelected?'selected':''}>${m}</option>`).join('')}</select>
+    </div>
+    <div class="kpi-row" style="margin-bottom:16px">
+      <div class="kpi"><div class="v">${mgrObj.repCount}</div><div class="l">МП в команде</div></div>
+      <div class="kpi"><div class="v">${fmtInt(mgrObj.totalPoints)}</div><div class="l">точек на команду</div></div>
+      <div class="kpi"><div class="v">${mgrObj.avgVisitRate ?? '—'}%</div><div class="l">ср. % визитов</div></div>
+      <div class="kpi"><div class="v">${fmtRub(mgrObj.totalSales)}</div><div class="l">продажи Q1+Q2</div></div>
+      <div class="kpi"><div class="v" style="color:${ratingColor(mgrObj.avgRating)}">${mgrObj.avgRating ?? '—'}</div><div class="l">ср. рейтинг (место ${mgrObj.ratingPlace ?? '—'})</div></div>
+    </div>
+    ${notes.map(n=>`<div class="note" style="background:${noteBg[n.t]};border-color:${noteColor[n.t]}55;color:${n.t==='ok'?'#155D3D':n.t==='warn'?'#7A5106':'var(--teal-dk)'}"><b>${n.t==='ok'?'✓':n.t==='warn'?'⚠':'ℹ'}</b> ${n.txt}</div>`).join('')}
+    <div class="hint" style="margin:14px 0 6px">Состав команды, по рейтингу:</div>
+    <div class="tbl-wrap"><table>
+      <thead><tr><th>Место</th><th>МП</th><th>Брик</th><th>% визитов</th><th>Продажи</th><th>Динамика</th><th>Рейтинг</th></tr></thead>
+      <tbody>${teamReps.map(r=>`<tr style="${r.mp===rep.mp?'background:var(--teal-tint)':''}">
+        <td class="mono">${r.ratingPlace??'—'}</td><td>${r.mp}${r.mp===rep.mp?' (вы)':''}</td>
+        <td style="color:var(--muted)">${r.bricks.join(', ')}</td>
+        <td class="mono">${r.visitRate??'—'}%</td><td class="mono">${fmtRub(r.salesTotal)}</td>
+        <td class="mono" style="color:${r.growthPct<0?'var(--danger)':'var(--a)'}">${r.growthPct!=null?(r.growthPct>0?'+':'')+r.growthPct+'%':'—'}</td>
+        <td>${ratingBadge(r.rating)}</td>
+      </tr>`).join('')}</tbody>
+    </table></div>
+  </div>`;
+}
+
+function metricRow(label, value, hint, extra){
+  return `<div class="bar-row" style="align-items:flex-start;padding:8px 0" title="${hint}">
+    <div class="lbl" style="width:260px;white-space:normal;line-height:1.3">${label}</div>
+    <div style="flex:1"></div>
+    <div style="text-align:right;min-width:150px">
+      <div class="mono" style="font-weight:700;font-size:14px">${value}</div>
+      ${extra? `<div style="font-size:11px;color:var(--muted-2);margin-top:2px">${extra}</div>` : ''}
+    </div>
+  </div>`;
+}
+function pctileBadge(v){
+  if(v==null) return '';
+  const color = v>=70?'var(--a)':v>=40?'var(--b)':'var(--danger)';
+  return `<span style="color:${color};font-weight:600">перцентиль ${v}</span>`;
+}
+function renderEfficiencyMetrics(rep, company){
+  return `
+  <div class="card">
+    <h3>Показатели эффективности</h3>
+    <div class="hint">Расчётные метрики для оценки эффективности работы, не только объёма территории — сравнение со средним по компании (92 МП) и, где применимо, перцентиль.</div>
+    ${metricRow('Выручка на 1 визит', rep.revPerVisit!=null?fmtRub(rep.revPerVisit):'—',
+        'Суммарные продажи территории, делённые на фактическое число визитов (плановых + внеплановых). Ключевой показатель отдачи от времени в поле.',
+        `в среднем по компании ${fmtRub(company.avgRevPerVisit)} · ${pctileBadge(rep.revPerVisitPctile)}`)}
+    ${metricRow('Выручка на 1 точку портфеля', rep.revPerPoint!=null?fmtRub(rep.revPerPoint):'—',
+        'Продажи, делённые на общее число закреплённых точек (не только целевых).',
+        `в среднем ${fmtRub(company.avgRevPerPoint)}`)}
+    ${metricRow('Выручка на 1 целевую точку', rep.revPerTarget!=null?fmtRub(rep.revPerTarget):'—',
+        'Продажи, делённые на число точек, отмеченных целевыми в Q3 — насколько монетизируется именно план визитов.',
+        `в среднем ${fmtRub(company.avgRevPerTarget)}`)}
+    ${metricRow('Hit-rate: доля точек с продажами', rep.hitRate!=null?rep.hitRate+'%':'—',
+        'Какая доля точек в портфеле вообще дала продажи в Q1–Q2 — показатель активации территории, а не «мёртвых» точек в списке.',
+        `в среднем ${company.avgHitRate}% · ${pctileBadge(rep.hitRatePctile)}`)}
+    ${metricRow('Концентрация продаж в топ-20% точек', rep.concentration!=null?rep.concentration+'%':'—',
+        'Какую долю продаж дают 20% лучших точек территории. Высокое значение = сильная зависимость от нескольких точек, риск при потере одной из них.',
+        `в среднем ${company.avgConcentration}%`)}
+    ${metricRow('Доля визитов вне плана', rep.extraVisitShare!=null?rep.extraVisitShare+'%':'—',
+        'Какая часть визитов сделана на точки, не включённые в целевой список Q3 — инициативная разведка новых точек либо рассинхрон с планом.',
+        `в среднем ${company.avgExtraVisitShare}%`)}
+    ${metricRow('Волатильность продаж по месяцам', rep.monthlyCV!=null?rep.monthlyCV+'%':'—',
+        'Коэффициент вариации помесячных продаж (янв–июнь). Ниже — работа более ровная и предсказуемая; выше — есть резкие провалы/всплески.',
+        `в среднем ${company.avgMonthlyCV}%`)}
+    ${metricRow('Эффективность освоения потенциала', rep.potentialEff!=null?fmtRub(rep.potentialEff):'—',
+        'Продажи, делённые на суммарный скоринг потенциала переписи по закреплённым точкам (независимая от МП оценка). Показывает, кто выжимает больше из территории такого же «богатства».',
+        `в среднем ${fmtRub(company.avgPotentialEff)} · ${pctileBadge(rep.potentialEffPctile)}`)}
+  </div>`;
+}
+
 function renderMyRep(){
   const {reps, points, company, bricks} = state.mp;
   if(!state.mp.selected) state.mp.selected = reps[0].mp;
@@ -782,6 +909,10 @@ function renderMyRep(){
       ${lineChart(rep.monthly)}
       <div class="legend"><span>${rep.monthly.map(v=>fmtRub(v)).join(' · ')}</span></div>
     </div>
+    ${renderEfficiencyMetrics(rep, company)}
+  </div>
+
+  <div class="grid-2">
     <div class="card">
       <h3>Брик: ${rep.bricks[0]||'—'}</h3>
       ${brickInfos.map(b=>`
@@ -797,6 +928,12 @@ function renderMyRep(){
   <div class="section">
     <h2>Сравнение с коллегами</h2>
     ${renderComparisonBlock(rep)}
+  </div>
+
+  <div class="section">
+    <h2>Выводы по команде</h2>
+    <p class="page-desc" style="margin-top:-4px">Аналитика по конкретному руководителю: как команда выглядит на фоне компании и какой разброс результатов внутри неё — чтобы делать оргвыводы по факту цифр, а не ощущениям.</p>
+    <div id="teamConclusionsWrap">${renderTeamConclusions(rep)}</div>
   </div>
 
   <div class="section">
@@ -1059,6 +1196,7 @@ function attachHandlersFor(tab){
     const sel = document.getElementById('mpSelect');
     if(sel) sel.addEventListener('change', e=>{
       state.mp.selected = e.target.value;
+      state.mp.teamAnalysisMgr = null;
       localStorage.setItem('sfe_selected_mp', state.mp.selected);
       render();
     });
@@ -1081,8 +1219,7 @@ function attachHandlersFor(tab){
     document.querySelectorAll('#modeChips .chip').forEach(chip=>{
       chip.addEventListener('click', ()=>{ state.mp.compareMode = chip.dataset.mode; render(); });
     });
-    const rankSearch = document.getElementById('rankSearch');
-    if(rankSearch) rankSearch.addEventListener('input', e=>{
+    const rankSearch = document.getElementById('rankSearch');    if(rankSearch) rankSearch.addEventListener('input', e=>{
       state.mp.rankQ = e.target.value;
       const rep = state.mp.reps.find(r=>r.mp===state.mp.selected);
       const {reps, managers} = state.mp;
@@ -1096,6 +1233,12 @@ function attachHandlersFor(tab){
       const q = state.mp.rankQ.toLowerCase();
       const filteredRows = q ? rows.filter(x=> (mode==='mp'?x.mp:x.mgr).toLowerCase().includes(q)) : rows;
       document.getElementById('compTableWrap').innerHTML = renderComparisonTable(mode, filteredRows, rep);
+    });
+    const teamMgrSel = document.getElementById('teamMgrSel');
+    if(teamMgrSel) teamMgrSel.addEventListener('change', e=>{
+      state.mp.teamAnalysisMgr = e.target.value;
+      const rep = state.mp.reps.find(r=>r.mp===state.mp.selected);
+      document.getElementById('teamConclusionsWrap').innerHTML = renderTeamConclusions(rep);
     });
   }
   if(tab==='overview'){

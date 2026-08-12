@@ -296,19 +296,52 @@ def process_sfe(path, outdir, census_df=None):
     for mp, g in assigned.groupby('МП'):
         targeted = int(g['targetQ3'].sum())
         plan_visited = int(g['plan_visited'].sum())
+        extra_visited = int(g['extra_visited'].sum())
+        total_visits = plan_visited + extra_visited
+        sales_total = float(g['sales_total'].sum())
+        points_n = len(g)
+
+        # выручка на визит / на точку / на целевую точку — эффективность использования времени и портфеля
+        rev_per_visit = round(sales_total / total_visits, 0) if total_visits > 0 else None
+        rev_per_point = round(sales_total / points_n, 0) if points_n > 0 else None
+        rev_per_target = round(sales_total / targeted, 0) if targeted > 0 else None
+
+        # hit-rate: доля точек портфеля, которые вообще дали продажи (активация точки)
+        hit_rate = round((g['sales_total'] > 0).sum() / points_n * 100, 1) if points_n > 0 else None
+
+        # концентрация: доля продаж, которую даёт топ-20% точек (риск зависимости от нескольких точек)
+        sorted_sales = g['sales_total'].sort_values(ascending=False)
+        top_n = max(1, round(points_n * 0.2))
+        concentration = round(sorted_sales.iloc[:top_n].sum() / sales_total * 100, 1) if sales_total > 0 else None
+
+        # доля визитов вне утверждённого плана Q3 — инициативность/несинхронизированность
+        extra_visit_share = round(extra_visited / total_visits * 100, 1) if total_visits > 0 else None
+
+        # стабильность помесячных продаж (коэфф. вариации, %) — ниже = ровнее работа в течение периода
+        monthly_vals = [round(float(g[f'Продажи ДБ 0{i} 25 Val'].sum() if f'Продажи ДБ 0{i} 25 Val' in g else 0) +
+                               float(g[f'Продажи AC 0{i} 25 Val'].sum() if f'Продажи AC 0{i} 25 Val' in g else 0), 1) for i in range(1, 7)]
+        m_mean = sum(monthly_vals) / len(monthly_vals)
+        monthly_cv = round((pd.Series(monthly_vals).std() / m_mean) * 100, 1) if m_mean > 0 else None
+
+        # эффективность освоения потенциала: выручка на балл скоринга переписи (сопоставленных точек)
+        cscore_sum = g['census_score'].dropna().sum()
+        potential_eff = round(sales_total / cscore_sum, 1) if cscore_sum and cscore_sum > 0 else None
+
         reps.append({
             'mp': mp, 'mgr': g['Менеджер'].mode().iat[0] if len(g['Менеджер'].mode()) else '',
             'bricks': sorted(g['БРИК'].dropna().unique().tolist()),
-            'points': len(g), 'targetedQ3': targeted, 'targetedQ4': int(g['targetQ4'].sum()),
-            'planVisited': plan_visited, 'extraVisited': int(g['extra_visited'].sum()), 'missedVisit': int(g['missed_visit'].sum()),
+            'points': points_n, 'targetedQ3': targeted, 'targetedQ4': int(g['targetQ4'].sum()),
+            'planVisited': plan_visited, 'extraVisited': extra_visited, 'missedVisit': int(g['missed_visit'].sum()),
             'visitRate': round(plan_visited / targeted * 100, 1) if targeted else None,
             'salesQ1': round(g['sales_q1'].sum(), 1), 'salesQ2': round(g['sales_q2'].sum(), 1),
-            'salesTotal': round(g['sales_total'].sum(), 1),
+            'salesTotal': round(sales_total, 1),
             'growthPct': round((g['sales_q2'].sum() - g['sales_q1'].sum()) / g['sales_q1'].sum() * 100, 1) if g['sales_q1'].sum() > 0 else None,
             'avgCensusScore': round(g['census_score'].mean(), 1) if g['census_score'].notna().any() else None,
             'highPotNotTargeted': int(((g['Потенциал'] == '7-10(Высокий)') & (~g['targetQ3'])).sum()),
-            'monthly': [round(float(g[f'Продажи ДБ 0{i} 25 Val'].sum() if f'Продажи ДБ 0{i} 25 Val' in g else 0) +
-                               float(g[f'Продажи AC 0{i} 25 Val'].sum() if f'Продажи AC 0{i} 25 Val' in g else 0), 1) for i in range(1, 7)],
+            'monthly': monthly_vals,
+            'revPerVisit': rev_per_visit, 'revPerPoint': rev_per_point, 'revPerTarget': rev_per_target,
+            'hitRate': hit_rate, 'concentration': concentration, 'extraVisitShare': extra_visit_share,
+            'monthlyCV': monthly_cv, 'potentialEff': potential_eff,
         })
     reps.sort(key=lambda x: -x['salesTotal'])
     n = len(reps)
@@ -324,6 +357,14 @@ def process_sfe(path, outdir, census_df=None):
         r['growthPctile'] = round((i + 1) / len(gr) * 100, 1)
     for r in reps:
         r.setdefault('growthPctile', None)
+
+    # перцентили для новых показателей эффективности — только для тех МП, где метрика определена
+    for field in ('revPerVisit', 'hitRate', 'potentialEff'):
+        vals = [r for r in reps if r[field] is not None]
+        for i, r in enumerate(sorted(vals, key=lambda x: x[field])):
+            r[field + 'Pctile'] = round((i + 1) / len(vals) * 100, 1) if vals else None
+        for r in reps:
+            r.setdefault(field + 'Pctile', None)
 
     # Композитный рейтинг: взвешенное среднее перцентилей продаж (40%), визитов (35%), динамики (25%).
     # Компонент пропускается, если для МП недоступен (напр. нет продаж в Q1 -> нет growthPctile) —
@@ -382,6 +423,11 @@ def process_sfe(path, outdir, census_df=None):
 
     growth_vals = [r['growthPct'] for r in reps if r['growthPct'] is not None]
     rating_vals = [r['rating'] for r in reps if r['rating'] is not None]
+
+    def avg_of(field):
+        vals = [r[field] for r in reps if r[field] is not None]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
     company = {
         'avgVisitRate': round(sum(r['visitRate'] for r in vr) / len(vr), 1) if vr else None,
         'avgSalesPerRep': round(sum(r['salesTotal'] for r in reps) / n, 1) if n else 0,
@@ -389,6 +435,10 @@ def process_sfe(path, outdir, census_df=None):
         'avgRating': round(sum(rating_vals) / len(rating_vals), 1) if rating_vals else None,
         'totalReps': n, 'totalAssignedPoints': len(assigned), 'totalBricks': len(bricks),
         'totalExtraVisited': int(assigned['extra_visited'].sum()), 'totalMissedVisit': int(assigned['missed_visit'].sum()),
+        'avgRevPerVisit': avg_of('revPerVisit'), 'avgRevPerPoint': avg_of('revPerPoint'),
+        'avgRevPerTarget': avg_of('revPerTarget'), 'avgHitRate': avg_of('hitRate'),
+        'avgConcentration': avg_of('concentration'), 'avgExtraVisitShare': avg_of('extraVisitShare'),
+        'avgMonthlyCV': avg_of('monthlyCV'), 'avgPotentialEff': avg_of('potentialEff'),
     }
     with open(os.path.join(outdir, 'mp_company.json'), 'w', encoding='utf-8') as f:
         json.dump(company, f, ensure_ascii=False)
