@@ -255,7 +255,8 @@ const state = {
   targets: JSON.parse(localStorage.getItem('sfe_targets') || '{}'), // {id: true/false} user overrides
   sort: {key:'score', dir:-1},
   filter: {q:'', tiers:new Set(['A','B','C','D']), onlyTarget:false},
-  mp: {loaded:false, points:[], reps:[], bricks:[], company:null, selected:null},
+  mp: {loaded:false, points:[], reps:[], bricks:[], managers:[], company:null, selected:null,
+       filterBrick:'', filterMgr:'', compareMode:'mp', rankQ:''},
 };
 
 const TIER_COLOR = {A:'var(--a)', B:'var(--b)', C:'var(--c)', D:'var(--d)'};
@@ -459,14 +460,16 @@ function render(){
 }
 
 async function loadMpData(){
-  const [pointsRaw, reps, bricks, company] = await Promise.all([
+  const [pointsRaw, reps, bricks, company, managers] = await Promise.all([
     fetchJson('data/mp_points.json'), fetchJson('data/mp_reps.json'),
-    fetchJson('data/mp_bricks.json'), fetchJson('data/mp_company.json'),
+    fetchJson('data/mp_bricks.json'), fetchJson('data/mp_company.json'), fetchJson('data/mp_managers.json'),
   ]);
-  state.mp.points = hydrateMpPoints(pointsRaw); state.mp.reps = reps; state.mp.bricks = bricks; state.mp.company = company;
+  state.mp.points = hydrateMpPoints(pointsRaw); state.mp.reps = reps; state.mp.bricks = bricks;
+  state.mp.company = company; state.mp.managers = managers;
   state.mp.loaded = true;
   if(!state.mp.selected) state.mp.selected = localStorage.getItem('sfe_selected_mp') || reps[0].mp;
 }
+function ruSort(arr){ return [...arr].sort((a,b)=>a.localeCompare(b,'ru')); }
 
 function emptyState(){
   return `<div class="topline"><h1>SFE Ядран</h1></div>
@@ -647,6 +650,92 @@ function mpInsights(rep, company, ownPoints){
   return notes;
 }
 
+function ratingColor(v){
+  if(v==null) return 'var(--muted-2)';
+  if(v>=65) return 'var(--a)'; if(v>=45) return 'var(--b)'; if(v>=25) return 'var(--c)'; return 'var(--danger)';
+}
+function ratingBadge(v){
+  return `<span class="tier-pill" style="background:${ratingColor(v)}">${v==null?'—':Math.round(v)}</span>`;
+}
+
+function renderComparisonBlock(rep){
+  const {reps, managers} = state.mp;
+  const mode = state.mp.compareMode;     // mp | mgr
+  const fBrick = state.mp.filterBrick;
+  const fMgr = state.mp.filterMgr;
+  const q = state.mp.rankQ.toLowerCase();
+
+  const brickList = ruSort([...new Set(reps.flatMap(r=>r.bricks))]);
+  const mgrList = ruSort([...new Set(reps.map(r=>r.mgr).filter(Boolean))]);
+
+  let repPool = reps;
+  if(fBrick) repPool = repPool.filter(r=>r.bricks.includes(fBrick));
+  if(fMgr) repPool = repPool.filter(r=>r.mgr===fMgr);
+  let mgrPool = managers;
+  if(fBrick) mgrPool = mgrPool.filter(m=>m.bricks.includes(fBrick));
+  if(fMgr) mgrPool = mgrPool.filter(m=>m.mgr===fMgr);
+
+  const rows = mode==='mp'
+    ? [...repPool].sort((a,b)=>(a.ratingPlace??999)-(b.ratingPlace??999))
+    : [...mgrPool].sort((a,b)=>(a.ratingPlace??999)-(b.ratingPlace??999));
+  const filteredRows = q ? rows.filter(x=> (mode==='mp'?x.mp:x.mgr).toLowerCase().includes(q)) : rows;
+
+  return `
+  <div class="card">
+    <div class="hint" style="margin-bottom:12px">
+      Рейтинг — взвешенная сумма перцентилей по продажам (40%), выполнению плана визитов (35%) и динамике Q1→Q2 (25%), 0–100.
+      ${filteredRows.length} ${mode==='mp'?'МП':'руководителей'} в выборке.
+    </div>
+    <div class="filters" style="margin-bottom:14px">
+      <button class="chip ${!fBrick?'on':''}" id="myBrickChip">Мой брик</button>
+      <button class="chip ${!fMgr?'on':''}" id="myTeamChip">Моя команда</button>
+      <button class="small-btn" id="clearFiltersBtn">Сбросить фильтры</button>
+      <label style="font-size:12.5px;color:var(--muted);font-weight:600;margin-left:6px">Брик:</label>
+      <select id="brickFilterSel"><option value="">Все бриков</option>${brickList.map(b=>`<option value="${b}" ${fBrick===b?'selected':''}>${b}</option>`).join('')}</select>
+      <label style="font-size:12.5px;color:var(--muted);font-weight:600">Руководитель:</label>
+      <select id="mgrFilterSel"><option value="">Все руководители</option>${mgrList.map(m=>`<option value="${m}" ${fMgr===m?'selected':''}>${m}</option>`).join('')}</select>
+      <div class="spacer"></div>
+      <div class="chip-group" id="modeChips">
+        <span class="chip ${mode==='mp'?'on':''}" data-mode="mp">По МП</span>
+        <span class="chip ${mode==='mgr'?'on':''}" data-mode="mgr">По руководителям (команды)</span>
+      </div>
+    </div>
+    <input type="search" id="rankSearch" placeholder="Поиск по имени…" value="${state.mp.rankQ}" style="width:240px;margin-bottom:12px">
+    <div id="compTableWrap">${renderComparisonTable(mode, filteredRows, rep)}</div>
+  </div>`;
+}
+function renderComparisonTable(mode, filteredRows, rep){
+  const headMp = `<tr><th>Место</th><th>МП</th><th>Брик</th><th>Руководитель</th><th>Точек</th><th>% визитов</th><th>Продажи Q1+Q2</th><th>Динамика</th><th>Рейтинг</th></tr>`;
+  const headMgr = `<tr><th>Место</th><th>Руководитель</th><th>МП в команде</th><th>Точек</th><th>Ср. % визитов</th><th>Суммарные продажи</th><th>Ср. динамика</th><th>Ср. рейтинг</th></tr>`;
+  const bodyMp = filteredRows.map(r=>`
+    <tr style="${r.mp===rep.mp?'background:var(--teal-tint)':''}">
+      <td class="mono">${r.ratingPlace??'—'}</td>
+      <td>${r.mp}${r.mp===rep.mp?' <b style="color:var(--teal-dk)">(вы)</b>':''}</td>
+      <td style="color:var(--muted)">${r.bricks.join(', ')}</td>
+      <td style="color:var(--muted)">${r.mgr||'—'}</td>
+      <td class="mono">${r.points}</td>
+      <td class="mono">${r.visitRate??'—'}%</td>
+      <td class="mono">${fmtRub(r.salesTotal)}</td>
+      <td class="mono" style="color:${r.growthPct<0?'var(--danger)':'var(--a)'}">${r.growthPct!=null?(r.growthPct>0?'+':'')+r.growthPct+'%':'—'}</td>
+      <td>${ratingBadge(r.rating)}</td>
+    </tr>`).join('');
+  const bodyMgr = filteredRows.map(m=>`
+    <tr style="${m.mgr===rep.mgr?'background:var(--teal-tint)':''}">
+      <td class="mono">${m.ratingPlace??'—'}</td>
+      <td>${m.mgr}${m.mgr===rep.mgr?' <b style="color:var(--teal-dk)">(ваш рук.)</b>':''}</td>
+      <td class="mono">${m.repCount}</td>
+      <td class="mono">${m.totalPoints}</td>
+      <td class="mono">${m.avgVisitRate??'—'}%</td>
+      <td class="mono">${fmtRub(m.totalSales)}</td>
+      <td class="mono" style="color:${m.avgGrowthPct<0?'var(--danger)':'var(--a)'}">${m.avgGrowthPct!=null?(m.avgGrowthPct>0?'+':'')+m.avgGrowthPct+'%':'—'}</td>
+      <td>${ratingBadge(m.avgRating)}</td>
+    </tr>`).join('');
+  return `<div class="tbl-wrap"><div style="max-height:520px;overflow:auto"><table>
+      <thead>${mode==='mp'?headMp:headMgr}</thead>
+      <tbody>${mode==='mp'?bodyMp:bodyMgr}</tbody>
+    </table></div></div>`;
+}
+
 function renderMyRep(){
   const {reps, points, company, bricks} = state.mp;
   if(!state.mp.selected) state.mp.selected = reps[0].mp;
@@ -660,7 +749,6 @@ function renderMyRep(){
   const leaderboard = [...reps].sort((a,b)=>b.salesTotal-a.salesTotal).slice(0,15);
   const maxSales = Math.max(...leaderboard.map(r=>r.salesTotal),1);
   const inTop15 = leaderboard.some(r=>r.mp===rep.mp);
-
   return `
   <div class="topline"><h1>Мои показатели</h1><span class="crumbs">Данные SFE, Q1–Q2 2025 (обучающий период)</span></div>
   <p class="page-desc">Личный дашборд медицинского представителя: ваш брик, покрытие плана визитов, динамика продаж и позиция среди коллег. Источник — модель сегментации SFE, сопоставленная с переписью аптек «Ядран» по ID точки.</p>
@@ -708,15 +796,7 @@ function renderMyRep(){
 
   <div class="section">
     <h2>Сравнение с коллегами</h2>
-    <div class="card">
-      <div class="hint">Топ-15 МП по суммарным продажам Q1+Q2. ${!inTop15?`Вы не входите в топ‑15 — ваша позиция: ${rep.salesPct} перцентиль.`:''}</div>
-      ${leaderboard.map(r=>`
-        <div class="bar-row">
-          <div class="lbl" style="${r.mp===rep.mp?'font-weight:700;color:var(--teal-dk)':''}">${r.mp}${r.mp===rep.mp?' (вы)':''}</div>
-          <div class="track"><div class="fill" style="width:${r.salesTotal/maxSales*100}%;background:${r.mp===rep.mp?'var(--teal)':'var(--d)'}"></div></div>
-          <div class="val">${fmtRub(r.salesTotal)}</div>
-        </div>`).join('')}
-    </div>
+    ${renderComparisonBlock(rep)}
   </div>
 
   <div class="section">
@@ -981,6 +1061,41 @@ function attachHandlersFor(tab){
       state.mp.selected = e.target.value;
       localStorage.setItem('sfe_selected_mp', state.mp.selected);
       render();
+    });
+    const brickSel = document.getElementById('brickFilterSel');
+    if(brickSel) brickSel.addEventListener('change', e=>{ state.mp.filterBrick = e.target.value; render(); });
+    const mgrSel = document.getElementById('mgrFilterSel');
+    if(mgrSel) mgrSel.addEventListener('change', e=>{ state.mp.filterMgr = e.target.value; render(); });
+    const myBrickChip = document.getElementById('myBrickChip');
+    if(myBrickChip) myBrickChip.addEventListener('click', ()=>{
+      const rep = state.mp.reps.find(r=>r.mp===state.mp.selected);
+      state.mp.filterBrick = rep.bricks[0] || ''; state.mp.filterMgr=''; render();
+    });
+    const myTeamChip = document.getElementById('myTeamChip');
+    if(myTeamChip) myTeamChip.addEventListener('click', ()=>{
+      const rep = state.mp.reps.find(r=>r.mp===state.mp.selected);
+      state.mp.filterMgr = rep.mgr || ''; state.mp.filterBrick=''; render();
+    });
+    const clearBtn = document.getElementById('clearFiltersBtn');
+    if(clearBtn) clearBtn.addEventListener('click', ()=>{ state.mp.filterBrick=''; state.mp.filterMgr=''; render(); });
+    document.querySelectorAll('#modeChips .chip').forEach(chip=>{
+      chip.addEventListener('click', ()=>{ state.mp.compareMode = chip.dataset.mode; render(); });
+    });
+    const rankSearch = document.getElementById('rankSearch');
+    if(rankSearch) rankSearch.addEventListener('input', e=>{
+      state.mp.rankQ = e.target.value;
+      const rep = state.mp.reps.find(r=>r.mp===state.mp.selected);
+      const {reps, managers} = state.mp;
+      const mode = state.mp.compareMode;
+      let repPool = reps, mgrPool = managers;
+      if(state.mp.filterBrick){ repPool = repPool.filter(r=>r.bricks.includes(state.mp.filterBrick)); mgrPool = mgrPool.filter(m=>m.bricks.includes(state.mp.filterBrick)); }
+      if(state.mp.filterMgr){ repPool = repPool.filter(r=>r.mgr===state.mp.filterMgr); mgrPool = mgrPool.filter(m=>m.mgr===state.mp.filterMgr); }
+      const rows = mode==='mp'
+        ? [...repPool].sort((a,b)=>(a.ratingPlace??999)-(b.ratingPlace??999))
+        : [...mgrPool].sort((a,b)=>(a.ratingPlace??999)-(b.ratingPlace??999));
+      const q = state.mp.rankQ.toLowerCase();
+      const filteredRows = q ? rows.filter(x=> (mode==='mp'?x.mp:x.mgr).toLowerCase().includes(q)) : rows;
+      document.getElementById('compTableWrap').innerHTML = renderComparisonTable(mode, filteredRows, rep);
     });
   }
   if(tab==='overview'){

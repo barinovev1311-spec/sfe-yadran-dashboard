@@ -319,8 +319,53 @@ def process_sfe(path, outdir, census_df=None):
         r['visitPct'] = round((i + 1) / len(vr) * 100, 1)
     for r in reps:
         r.setdefault('visitPct', None)
+    gr = [r for r in reps if r['growthPct'] is not None]
+    for i, r in enumerate(sorted(gr, key=lambda x: x['growthPct'])):
+        r['growthPctile'] = round((i + 1) / len(gr) * 100, 1)
+    for r in reps:
+        r.setdefault('growthPctile', None)
+
+    # Композитный рейтинг: взвешенное среднее перцентилей продаж (40%), визитов (35%), динамики (25%).
+    # Компонент пропускается, если для МП недоступен (напр. нет продаж в Q1 -> нет growthPctile) —
+    # веса остальных компонентов перенормируются, чтобы рейтинг оставался сравнимым 0..100.
+    WEIGHTS = {'salesPct': 0.40, 'visitPct': 0.35, 'growthPctile': 0.25}
+    for r in reps:
+        parts = [(r[k], w) for k, w in WEIGHTS.items() if r[k] is not None]
+        r['rating'] = round(sum(v * w for v, w in parts) / sum(w for _, w in parts), 1) if parts else None
+    ranked = sorted([r for r in reps if r['rating'] is not None], key=lambda x: -x['rating'])
+    for i, r in enumerate(ranked):
+        r['ratingPlace'] = i + 1
+    for r in reps:
+        r.setdefault('ratingPlace', None)
+    reps.sort(key=lambda x: (x['ratingPlace'] is None, x['ratingPlace']))
+
     with open(os.path.join(outdir, 'mp_reps.json'), 'w', encoding='utf-8') as f:
         json.dump(reps, f, ensure_ascii=False, separators=(',', ':'))
+
+    # Рейтинг команд по руководителям — агрегаты поверх уже посчитанных рейтингов МП.
+    managers = []
+    for mgr, grp in {r['mgr']: [x for x in reps if x['mgr'] == r['mgr']] for r in reps if r['mgr']}.items():
+        ratings = [x['rating'] for x in grp if x['rating'] is not None]
+        visits = [x['visitRate'] for x in grp if x['visitRate'] is not None]
+        growths = [x['growthPct'] for x in grp if x['growthPct'] is not None]
+        managers.append({
+            'mgr': mgr, 'repCount': len(grp),
+            'bricks': sorted({b for x in grp for b in x['bricks']}),
+            'totalPoints': sum(x['points'] for x in grp),
+            'totalTargetedQ3': sum(x['targetedQ3'] for x in grp),
+            'totalSales': round(sum(x['salesTotal'] for x in grp), 1),
+            'avgVisitRate': round(sum(visits) / len(visits), 1) if visits else None,
+            'avgGrowthPct': round(sum(growths) / len(growths), 1) if growths else None,
+            'avgRating': round(sum(ratings) / len(ratings), 1) if ratings else None,
+        })
+    managers_ranked = sorted([m for m in managers if m['avgRating'] is not None], key=lambda x: -x['avgRating'])
+    for i, m in enumerate(managers_ranked):
+        m['ratingPlace'] = i + 1
+    for m in managers:
+        m.setdefault('ratingPlace', None)
+    managers.sort(key=lambda x: (x['ratingPlace'] is None, x['ratingPlace']))
+    with open(os.path.join(outdir, 'mp_managers.json'), 'w', encoding='utf-8') as f:
+        json.dump(managers, f, ensure_ascii=False, separators=(',', ':'))
 
     bricks = []
     for brick, g in sfe.groupby('БРИК'):
@@ -336,10 +381,12 @@ def process_sfe(path, outdir, census_df=None):
         json.dump(bricks, f, ensure_ascii=False, separators=(',', ':'))
 
     growth_vals = [r['growthPct'] for r in reps if r['growthPct'] is not None]
+    rating_vals = [r['rating'] for r in reps if r['rating'] is not None]
     company = {
         'avgVisitRate': round(sum(r['visitRate'] for r in vr) / len(vr), 1) if vr else None,
         'avgSalesPerRep': round(sum(r['salesTotal'] for r in reps) / n, 1) if n else 0,
         'avgGrowthPct': round(sum(growth_vals) / len(growth_vals), 1) if growth_vals else None,
+        'avgRating': round(sum(rating_vals) / len(rating_vals), 1) if rating_vals else None,
         'totalReps': n, 'totalAssignedPoints': len(assigned), 'totalBricks': len(bricks),
         'totalExtraVisited': int(assigned['extra_visited'].sum()), 'totalMissedVisit': int(assigned['missed_visit'].sum()),
     }
