@@ -302,11 +302,12 @@ function showFatalError(err){
 }
 
 async function boot(){
-  let idx;
+  let idx, meta;
   try{
-    idx = await fetchJson('data/_index.json');
+    [idx, meta] = await Promise.all([fetchJson('data/_index.json'), fetchJson('data/_meta.json')]);
   } catch(e){ showFatalError(e); return; }
   state.index = idx;
+  state.meta = meta;
   const sel = document.getElementById('regionSel');
   state.index.forEach(r=>{
     const opt = document.createElement('option');
@@ -330,6 +331,43 @@ function titleCase(s){
   return s.toLowerCase().replace(/(^|\s|-)([а-яa-z])/g, (m,p1,p2)=>p1+p2.toUpperCase());
 }
 
+function tierOf(score){ if(score>=70) return 'A'; if(score>=50) return 'B'; if(score>=30) return 'C'; return 'D'; }
+function scoreOf(toRank, chk, lp, hasNet){
+  const m = state.meta;
+  const nTo = (toRank-1)/9*100;
+  const nCheck = (chk-m.checkMin)/(m.checkMax-m.checkMin)*100;
+  const nLp = (lp-m.lpMin)/(m.lpMax-m.lpMin)*100;
+  let s = nTo*0.5 + nCheck*0.25 + nLp*0.15 + (hasNet?10:0);
+  return Math.max(0, Math.min(100, Math.round(s*10)/10));
+}
+// Разворачивает компактный формат {d:{n,g,o,c}, r:[[id,netIdx,grpIdx,orgIdx,addr,cityIdx,toRank,chk,lp,bad,oth],...]}
+// в привычные объекты записей, которые использует остальной код.
+function hydrateCensus(payload){
+  const {d, r} = payload;
+  return r.map(row=>{
+    const [id, ni, gi, oi, addr, ci, toRank, chk, lp, bad, oth] = row;
+    const net = d.n[ni], grp = d.g[gi];
+    const score = scoreOf(toRank, chk, lp, !!net);
+    return {
+      id, net, grp, org: d.o[oi], addr, city: d.c[ci],
+      toCat: state.meta.toLabels[toRank-1], toRank, toVal: state.meta.toVals[toRank-1],
+      chk, lp, bad, oth, score, tier: tierOf(score),
+    };
+  });
+}
+function hydrateMpPoints(payload){
+  const {d, r} = payload;
+  const potLabels = ['Низкий','Средний','Высокий'];
+  return r.map(row=>{
+    const [mi, oi, addr, ci, ni, pot, tQ3, visited, sQ1, sQ2, cScore] = row;
+    return {
+      mp: d.mp[mi], org: d.o[oi], addr, city: d.c[ci], net: d.n[ni],
+      pot: pot>=0? potLabels[pot] : 'Н/Д', tQ3: !!tQ3, visited: !!visited,
+      sQ1, sQ2, cScore: cScore==null? null : cScore,
+    };
+  });
+}
+
 async function onRegionChange(e){
   const slug = e.target.value;
   if(!slug){ state.region=null; state.data=[]; renderSidebarState(); render(); return; }
@@ -341,7 +379,7 @@ async function onRegionChange(e){
   renderSidebarState();
   render();
   try{
-    state.data = await fetchJson(`data/${slug}.json`);
+    state.data = hydrateCensus(await fetchJson(`data/${slug}.json`));
   } catch(err){
     state.loading = false;
     state.loadError = err.message;
@@ -421,11 +459,11 @@ function render(){
 }
 
 async function loadMpData(){
-  const [points, reps, bricks, company] = await Promise.all([
+  const [pointsRaw, reps, bricks, company] = await Promise.all([
     fetchJson('data/mp_points.json'), fetchJson('data/mp_reps.json'),
     fetchJson('data/mp_bricks.json'), fetchJson('data/mp_company.json'),
   ]);
-  state.mp.points = points; state.mp.reps = reps; state.mp.bricks = bricks; state.mp.company = company;
+  state.mp.points = hydrateMpPoints(pointsRaw); state.mp.reps = reps; state.mp.bricks = bricks; state.mp.company = company;
   state.mp.loaded = true;
   if(!state.mp.selected) state.mp.selected = localStorage.getItem('sfe_selected_mp') || reps[0].mp;
 }

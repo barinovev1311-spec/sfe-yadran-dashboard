@@ -97,10 +97,15 @@ def process_census(path, outdir):
     if missing:
         sys.exit(f'[перепись] В файле не хватает колонок: {missing}\nПроверь, что структура файла не изменилась.')
 
-    df = score_census(df)
+    df['to_rank'] = df['КАТЕГОРИЯ RNC ПО ВАЛОВОМУ ТО'].map(TO_RANK)
+    df['check_val'] = df['ОЦЕНКА СРЕДНЕГО ЧЕКА ТОЧКИ'].map(CHECK_MAP)
+    lp_pct_all = df['ЛП, %'] * 100
+
     os.makedirs(outdir, exist_ok=True)
     index = []
     seen = {}
+    # компактный формат: словари (net/grp/org/city) + строки-массивы без ключей.
+    # score/tier/toCat/toVal больше НЕ хранятся — считаются в браузере по _meta.json.
     for region, g in df.groupby('СУБЪЕКТ ФЕДЕРАЦИИ'):
         slug = translit_slug(region)
         if slug in seen:
@@ -108,28 +113,57 @@ def process_census(path, outdir):
             slug = f'{slug}_{seen[slug]}'
         else:
             seen[slug] = 0
-        recs = []
+
+        net_dict, grp_dict, org_dict, city_dict = {}, {}, {}, {}
+        def idx_of(d, val):
+            val = val if val and val != '-' else ''
+            if val not in d:
+                d[val] = len(d)
+            return d[val]
+
+        rows = []
         for _, r in g.iterrows():
-            recs.append({
-                'id': int(r['ID RNC']), 'inn': str(r['ИНН']),
-                'net': r['СЕТЬ'] if r['СЕТЬ'] != '-' else '',
-                'grp': r['СЕТЬ, ЯДРАН'] if r['СЕТЬ, ЯДРАН'] != '-' else '',
-                'sub': r['СЕТЬ, ЯДРАН ДЕТАЛИЗАЦИЯ'] if r['СЕТЬ, ЯДРАН ДЕТАЛИЗАЦИЯ'] != '-' else '',
-                'org': r['ЮРИДИЧЕСКОЕ ЛИЦО'], 'addr': r['АДРЕС'], 'city': r['НАСЕЛЕННЫЙ ПУНКТ'],
-                'toCat': r['to_label'], 'toRank': int(r['to_rank']), 'toVal': r['to_val'],
-                'chk': int(r['check_val']), 'lp': round(float(r['ЛП, %']) * 100, 1),
-                'bad': round(float(r['БАД, %']) * 100, 1), 'oth': round(float(r['ПРОЧИЙ АССОРТИМЕНТ, %']) * 100, 1),
-                'score': float(r['score']), 'tier': r['tier'],
-            })
+            ni = idx_of(net_dict, r['СЕТЬ'])
+            gi = idx_of(grp_dict, r['СЕТЬ, ЯДРАН'])
+            oi = idx_of(org_dict, r['ЮРИДИЧЕСКОЕ ЛИЦО'])
+            ci = idx_of(city_dict, r['НАСЕЛЕННЫЙ ПУНКТ'])
+            rows.append([
+                int(r['ID RNC']), ni, gi, oi, r['АДРЕС'], ci,
+                int(r['to_rank']), int(r['check_val']),
+                round(float(r['ЛП, %']) * 100, 1), round(float(r['БАД, %']) * 100, 1),
+                round(float(r['ПРОЧИЙ АССОРТИМЕНТ, %']) * 100, 1),
+            ])
+
+        payload = {
+            'd': {
+                'n': sorted(net_dict, key=net_dict.get), 'g': sorted(grp_dict, key=grp_dict.get),
+                'o': sorted(org_dict, key=org_dict.get), 'c': sorted(city_dict, key=city_dict.get),
+            },
+            'r': rows,
+        }
         with open(os.path.join(outdir, f'{slug}.json'), 'w', encoding='utf-8') as f:
-            json.dump(recs, f, ensure_ascii=False, separators=(',', ':'))
+            json.dump(payload, f, ensure_ascii=False, separators=(',', ':'))
+
+        scored = score_census(g)
         cities = sorted(g['НАСЕЛЕННЫЙ ПУНКТ'].unique().tolist())
-        index.append({'region': region, 'slug': slug, 'count': len(g), 'avgScore': round(g['score'].mean(), 1),
-                       'tierA': int((g['tier'] == 'A').sum()), 'cities': cities})
+        index.append({'region': region, 'slug': slug, 'count': len(g), 'avgScore': round(scored['score'].mean(), 1),
+                       'tierA': int((scored['tier'] == 'A').sum()), 'cities': cities})
     index.sort(key=lambda x: x['region'])
     with open(os.path.join(outdir, '_index.json'), 'w', encoding='utf-8') as f:
         json.dump(index, f, ensure_ascii=False, separators=(',', ':'))
-    print(f'[перепись] готово: {len(index)} регионов, {len(df)} точек -> {outdir}/')
+
+    to_label = {k: k.split('. ', 1)[1].replace('РУБ.', 'руб.').replace('МЛН', 'млн') for k in TO_MAP}
+    meta = {
+        'toLabels': [to_label[k] for k in sorted(TO_MAP, key=TO_RANK.get)],
+        'toVals': [TO_MAP[k] for k in sorted(TO_MAP, key=TO_RANK.get)],
+        'checkMin': min(CHECK_MAP.values()), 'checkMax': max(CHECK_MAP.values()),
+        'lpMin': round(float(lp_pct_all.min()), 3), 'lpMax': round(float(lp_pct_all.max()), 3),
+    }
+    with open(os.path.join(outdir, '_meta.json'), 'w', encoding='utf-8') as f:
+        json.dump(meta, f, ensure_ascii=False)
+
+    df = score_census(df)  # для линковки с SFE, если понадобится в этом же запуске
+    print(f'[перепись] готово: {len(index)} регионов, {len(df)} точек -> {outdir}/ (компактный формат)')
     return df
 
 
@@ -230,21 +264,33 @@ def process_sfe(path, outdir, census_df=None):
             vals.append(round(v, 1))
         return vals
 
-    points = []
+    pot_code = {'Низкий': 0, 'Средний': 1, 'Высокий': 2}
+    mp_dict, org_dict, net_dict, city_dict = {}, {}, {}, {}
+    def idx_of(d, val):
+        val = val if val else ''
+        if val not in d:
+            d[val] = len(d)
+        return d[val]
+
+    rows = []
     for _, r in assigned.iterrows():
-        points.append({
-            'mp': r['МП'], 'brick': r['БРИК'], 'mgr': r['Менеджер'] or '',
-            'id': int(r['ID ТОЧКИ_RNC']) if pd.notna(r['ID ТОЧКИ_RNC']) else None,
-            'org': r['ЮРИДИЧЕСКОЕ ЛИЦО'] or '', 'addr': r['АДРЕС АПТЕКИ'] or '', 'city': r['НАСЕЛЕННЫЙ ПУНКТ'] or '',
-            'net': r['СЕТЬ, ЯДРАН'] if r['СЕТЬ, ЯДРАН'] not in ('-', None) else '',
-            'pot': r['pot'] or 'Н/Д', 'tQ3': bool(r['targetQ3']), 'tQ4': bool(r['targetQ4']), 'visited': bool(r['visited']),
-            'sQ1': round(float(r['sales_q1']), 1), 'sQ2': round(float(r['sales_q2']), 1),
-            'm': monthly_sum(r),
-            'cScore': float(r['census_score']) if pd.notna(r['census_score']) else None,
-            'cTier': r['census_tier'] if pd.notna(r['census_tier']) else None,
-        })
+        mi = idx_of(mp_dict, r['МП'])
+        oi = idx_of(org_dict, r['ЮРИДИЧЕСКОЕ ЛИЦО'] or '')
+        ni = idx_of(net_dict, r['СЕТЬ, ЯДРАН'] if r['СЕТЬ, ЯДРАН'] not in ('-', None) else '')
+        ci = idx_of(city_dict, r['НАСЕЛЕННЫЙ ПУНКТ'] or '')
+        pot = pot_code.get(r['pot'], -1)
+        cs = round(float(r['census_score']), 1) if pd.notna(r['census_score']) else None
+        rows.append([mi, oi, r['АДРЕС АПТЕКИ'] or '', ci, ni, pot,
+                     1 if r['targetQ3'] else 0, 1 if r['visited'] else 0,
+                     round(float(r['sales_q1']), 1), round(float(r['sales_q2']), 1), cs])
+
+    points_payload = {
+        'd': {'mp': sorted(mp_dict, key=mp_dict.get), 'o': sorted(org_dict, key=org_dict.get),
+              'n': sorted(net_dict, key=net_dict.get), 'c': sorted(city_dict, key=city_dict.get)},
+        'r': rows,
+    }
     with open(os.path.join(outdir, 'mp_points.json'), 'w', encoding='utf-8') as f:
-        json.dump(points, f, ensure_ascii=False, separators=(',', ':'))
+        json.dump(points_payload, f, ensure_ascii=False, separators=(',', ':'))
 
     reps = []
     for mp, g in assigned.groupby('МП'):
