@@ -224,6 +224,7 @@ footer.credit{margin-top:30px; color:var(--muted-2); font-size:11px}
       <div class="territory-current" id="territoryCurrent"></div>
     </div>
     <nav class="tabs" id="tabs">
+      <button class="tab-btn" data-tab="myrep"><span class="n">★</span>Мои показатели (МП)</button>
       <button class="tab-btn" data-tab="overview"><span class="n">1</span>Территория и точки</button>
       <button class="tab-btn" data-tab="map"><span class="n">2</span>Карта</button>
       <button class="tab-btn" data-tab="route"><span class="n">3</span>Маршрутизация</button>
@@ -254,6 +255,7 @@ const state = {
   targets: JSON.parse(localStorage.getItem('sfe_targets') || '{}'), // {id: true/false} user overrides
   sort: {key:'score', dir:-1},
   filter: {q:'', tiers:new Set(['A','B','C','D']), onlyTarget:false},
+  mp: {loaded:false, points:[], reps:[], bricks:[], company:null, selected:null},
 };
 
 const TIER_COLOR = {A:'var(--a)', B:'var(--b)', C:'var(--c)', D:'var(--d)'};
@@ -270,9 +272,41 @@ function isUserOverridden(rec){ return state.targets.hasOwnProperty(rec.id); }
 /* ============================================================
    BOOTSTRAP
 ============================================================ */
+async function fetchJson(url, timeoutMs=15000){
+  const ctrl = new AbortController();
+  const t = setTimeout(()=>ctrl.abort(), timeoutMs);
+  try{
+    const res = await fetch(url, {signal: ctrl.signal, cache:'no-store'});
+    clearTimeout(t);
+    if(!res.ok) throw new Error(`HTTP ${res.status} при загрузке ${url}`);
+    const ct = res.headers.get('content-type')||'';
+    const text = await res.text();
+    if(!ct.includes('json') && text.trim().startsWith('<')) throw new Error(`Сервер вернул HTML вместо JSON для ${url} — файл не найден по этому пути на сервере`);
+    try{ return JSON.parse(text); }
+    catch(e){ throw new Error(`Битый JSON в ${url}: ${e.message}`); }
+  } catch(e){
+    clearTimeout(t);
+    if(e.name==='AbortError') throw new Error(`Таймаут загрузки ${url} (>${timeoutMs/1000}с) — сервер не отвечает`);
+    throw e;
+  }
+}
+
+function showFatalError(err){
+  console.error(err);
+  document.getElementById('main').innerHTML = `
+    <div class="topline"><h1>Ошибка загрузки данных</h1></div>
+    <div class="empty" style="border-color:var(--danger)">
+      <b>${(err && err.message) || err}</b><br><br>
+      <span style="font-size:12px">Открой консоль браузера (F12 → Console/Network) — там будет видно, какой именно файл не загрузился. Частая причина на Railway: файл не попал в деплой или раздаётся не с тем content-type.</span>
+    </div>`;
+}
+
 async function boot(){
-  const res = await fetch('data/_index.json');
-  state.index = await res.json();
+  let idx;
+  try{
+    idx = await fetchJson('data/_index.json');
+  } catch(e){ showFatalError(e); return; }
+  state.index = idx;
   const sel = document.getElementById('regionSel');
   state.index.forEach(r=>{
     const opt = document.createElement('option');
@@ -303,10 +337,17 @@ async function onRegionChange(e){
   state.region = meta.region;
   state.city = null;
   state.loading = true;
+  state.loadError = null;
   renderSidebarState();
   render();
-  const res = await fetch(`data/${slug}.json`);
-  state.data = await res.json();
+  try{
+    state.data = await fetchJson(`data/${slug}.json`);
+  } catch(err){
+    state.loading = false;
+    state.loadError = err.message;
+    render();
+    return;
+  }
   state.loading = false;
 
   const citySel = document.getElementById('citySel');
@@ -324,7 +365,7 @@ function onCityChange(e){ state.city = e.target.value || null; render(); }
 function renderSidebarState(){
   const cur = document.getElementById('territoryCurrent');
   document.querySelectorAll('.tab-btn').forEach(b=>{
-    b.disabled = !state.region && b.dataset.tab!=='regions';
+    b.disabled = !state.region && b.dataset.tab!=='regions' && b.dataset.tab!=='myrep';
     b.classList.toggle('active', b.dataset.tab===state.tab);
   });
   if(state.region){
@@ -347,6 +388,16 @@ function currentSet(){
 function render(){
   renderSidebarState();
   const main = document.getElementById('main');
+  if(state.tab==='myrep'){
+    if(!state.mp.loaded){
+      main.innerHTML = `<div class="loading"><div class="spin"></div>Загрузка показателей МП…</div>`;
+      loadMpData().then(render).catch(e=>{ main.innerHTML=''; showFatalError(e); });
+      return;
+    }
+    main.innerHTML = renderMyRep();
+    attachHandlersFor('myrep');
+    return;
+  }
   if(state.tab!=='regions' && !state.region){
     main.innerHTML = emptyState();
     return;
@@ -355,12 +406,28 @@ function render(){
     main.innerHTML = `<div class="loading"><div class="spin"></div>Загрузка территории…</div>`;
     return;
   }
+  if(state.loadError){
+    main.innerHTML = `<div class="topline"><h1>Не удалось загрузить регион</h1></div>
+      <div class="empty" style="border-color:var(--danger)"><b>${state.loadError}</b><br><br>
+      <span style="font-size:12px">Попробуй выбрать регион ещё раз. Если ошибка повторяется — проверь в Network (F12), какой URL запрашивается и что по нему реально отвечает сервер.</span></div>`;
+    return;
+  }
   const renderers = {
     overview: renderOverview, map: renderMap, route: renderRoute,
     segments: renderSegments, abc: renderAbc, whitespace: renderWhitespace, regions: renderRegions,
   };
   main.innerHTML = renderers[state.tab]();
   attachHandlersFor(state.tab);
+}
+
+async function loadMpData(){
+  const [points, reps, bricks, company] = await Promise.all([
+    fetchJson('data/mp_points.json'), fetchJson('data/mp_reps.json'),
+    fetchJson('data/mp_bricks.json'), fetchJson('data/mp_company.json'),
+  ]);
+  state.mp.points = points; state.mp.reps = reps; state.mp.bricks = bricks; state.mp.company = company;
+  state.mp.loaded = true;
+  if(!state.mp.selected) state.mp.selected = localStorage.getItem('sfe_selected_mp') || reps[0].mp;
 }
 
 function emptyState(){
@@ -482,6 +549,158 @@ function assortBar(r){
     <span style="width:${r.bad}%;background:var(--amber)"></span>
     <span style="width:${r.oth}%;background:var(--d)"></span>
   </div>`;
+}
+
+/* ============================================================
+   TAB ★: MY REP DASHBOARD (МП)
+============================================================ */
+function lineChart(series, w=640, h=140, color='var(--teal)'){
+  const max = Math.max(...series, 1), min = Math.min(0, ...series);
+  const range = (max-min)||1;
+  const step = w/(series.length-1);
+  const pts = series.map((v,i)=>`${(i*step).toFixed(1)},${(h-6-(v-min)/range*(h-16)).toFixed(1)}`).join(' ');
+  const dots = series.map((v,i)=>`<circle cx="${(i*step).toFixed(1)}" cy="${(h-6-(v-min)/range*(h-16)).toFixed(1)}" r="3.5" fill="${color}"/>`).join('');
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="width:100%;height:${h}px">
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+    ${dots}</svg>`;
+}
+function fmtRub(n){
+  if(n>=1e6) return (n/1e6).toFixed(1)+' млн ₽';
+  if(n>=1e3) return (n/1e3).toFixed(0)+' тыс ₽';
+  return Math.round(n)+' ₽';
+}
+
+function mpInsights(rep, company, ownPoints){
+  const notes = [];
+  if(rep.visitRate!=null){
+    const diff = (rep.visitRate - company.avgVisitRate).toFixed(1);
+    if(rep.visitRate < company.avgVisitRate - 5){
+      notes.push({t:'warn', txt:`Выполнение плана визитов ${rep.visitRate}% — ниже среднего по компании (${company.avgVisitRate}%) на ${Math.abs(diff)} п.п. ${rep.missedVisit} целевых точек без визита в Q1.`});
+    } else {
+      notes.push({t:'ok', txt:`Выполнение плана визитов ${rep.visitRate}% — на уровне или выше среднего по компании (${company.avgVisitRate}%).`});
+    }
+  }
+  if(rep.extraVisited>0){
+    notes.push({t:'info', txt:`${rep.extraVisited} визитов сделано вне утверждённого плана Q3 — возможно, точечная разведка новых точек или несинхронизированный план.`});
+  }
+  if(rep.growthPct!=null){
+    const diff=(rep.growthPct-company.avgGrowthPct).toFixed(1);
+    if(rep.growthPct < company.avgGrowthPct){
+      notes.push({t:'warn', txt:`Продажи Q1→Q2 изменились на ${rep.growthPct}%, это хуже среднего по компании (${company.avgGrowthPct}%) на ${Math.abs(diff)} п.п. Компания в целом тоже просела — падение может быть сезонным, но стоит сверить с командой.`});
+    } else {
+      notes.push({t:'ok', txt:`Динамика продаж Q1→Q2 (${rep.growthPct}%) лучше среднего по компании (${company.avgGrowthPct}%).`});
+    }
+  }
+  if(rep.highPotNotTargeted>0){
+    notes.push({t:'warn', txt:`${rep.highPotNotTargeted} точек с высоким потенциалом (по собственной модели компании) не включены в целевой список — потенциальные слепые зоны на вашей территории.`});
+  }
+  if(rep.salesPct!=null){
+    notes.push({t: rep.salesPct>=70?'ok':rep.salesPct<=30?'warn':'info',
+      txt:`По суммарным продажам вы на ${rep.salesPct}-м перцентиле среди ${company.totalReps} МП (100 — максимум).`});
+  }
+  if(ownPoints.length>=5){
+    const sorted=[...ownPoints].sort((a,b)=>(b.sQ1+b.sQ2)-(a.sQ1+a.sQ2));
+    const top20n=Math.max(1,Math.round(sorted.length*0.2));
+    const totalSales=sorted.reduce((s,p)=>s+p.sQ1+p.sQ2,0)||1;
+    const topSales=sorted.slice(0,top20n).reduce((s,p)=>s+p.sQ1+p.sQ2,0);
+    const sharePct=(topSales/totalSales*100).toFixed(0);
+    notes.push({t:'info', txt:`Топ-20% ваших точек (${top20n} из ${sorted.length}) дают ${sharePct}% суммарных продаж территории — ${sharePct>65?'высокая концентрация, эти точки требуют максимального внимания и защиты от конкурентов':'нагрузка распределена относительно равномерно'}.`});
+  }
+  return notes;
+}
+
+function renderMyRep(){
+  const {reps, points, company, bricks} = state.mp;
+  if(!state.mp.selected) state.mp.selected = reps[0].mp;
+  const rep = reps.find(r=>r.mp===state.mp.selected) || reps[0];
+  const ownPoints = points.filter(p=>p.mp===rep.mp);
+  const brickInfos = rep.bricks.map(b=>bricks.find(x=>x.brick===b)).filter(Boolean);
+  const notes = mpInsights(rep, company, ownPoints);
+  const noteColor = {warn:'var(--amber)', ok:'var(--a)', info:'var(--b)'};
+  const noteBg = {warn:'var(--amber-tint)', ok:'var(--a-tint)', info:'var(--b-tint)'};
+
+  const leaderboard = [...reps].sort((a,b)=>b.salesTotal-a.salesTotal).slice(0,15);
+  const maxSales = Math.max(...leaderboard.map(r=>r.salesTotal),1);
+  const inTop15 = leaderboard.some(r=>r.mp===rep.mp);
+
+  return `
+  <div class="topline"><h1>Мои показатели</h1><span class="crumbs">Данные SFE, Q1–Q2 2025 (обучающий период)</span></div>
+  <p class="page-desc">Личный дашборд медицинского представителя: ваш брик, покрытие плана визитов, динамика продаж и позиция среди коллег. Источник — модель сегментации SFE, сопоставленная с переписью аптек «Ядран» по ID точки.</p>
+
+  <div class="filters">
+    <label style="font-size:12.5px;color:var(--muted);font-weight:600">Медпредставитель:</label>
+    <select id="mpSelect" style="width:260px">
+      ${reps.map(r=>`<option value="${r.mp}" ${r.mp===rep.mp?'selected':''}>${r.mp} (${r.points} т.)</option>`).join('')}
+    </select>
+    <span class="net-badge" style="font-size:12px">Брик: ${rep.bricks.join(', ')||'—'}</span>
+    <span class="net-badge" style="font-size:12px">Руководитель: ${rep.mgr||'—'}</span>
+  </div>
+
+  <div class="kpi-row">
+    <div class="kpi"><div class="v">${fmtInt(rep.points)}</div><div class="l">точек закреплено</div></div>
+    <div class="kpi"><div class="v">${fmtInt(rep.targetedQ3)}</div><div class="l">целевых в Q3</div></div>
+    <div class="kpi"><div class="v ${rep.visitRate<company.avgVisitRate?'':'tierA'}">${rep.visitRate ?? '—'}%</div><div class="l">визитов от плана (ср. ${company.avgVisitRate}%)</div></div>
+    <div class="kpi"><div class="v">${fmtRub(rep.salesTotal)}</div><div class="l">продажи Q1+Q2 (ДБ+АС)</div></div>
+    <div class="kpi"><div class="v ${rep.growthPct<0?'':'tierA'}">${rep.growthPct>0?'+':''}${rep.growthPct ?? '—'}%</div><div class="l">динамика Q1→Q2 (ср. ${company.avgGrowthPct}%)</div></div>
+  </div>
+
+  <div class="section">
+    <h2>Аналитические выводы</h2>
+    ${notes.map(n=>`<div class="note" style="background:${noteBg[n.t]};border-color:${noteColor[n.t]}55;color:${n.t==='ok'?'#155D3D':n.t==='warn'?'#7A5106':'var(--teal-dk)'}"><b>${n.t==='ok'?'✓':n.t==='warn'?'⚠':'ℹ'}</b> ${n.txt}</div>`).join('')}
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h3>Продажи по месяцам территории (ДБ+АС)</h3>
+      <div class="hint">Янв–июнь 2025, руб.</div>
+      ${lineChart(rep.monthly)}
+      <div class="legend"><span>${rep.monthly.map(v=>fmtRub(v)).join(' · ')}</span></div>
+    </div>
+    <div class="card">
+      <h3>Брик: ${rep.bricks[0]||'—'}</h3>
+      ${brickInfos.map(b=>`
+        <div class="hint" style="margin-bottom:10px">Всего точек на брике: <b style="color:var(--ink)">${b.totalPoints}</b>, вы закрываете <b style="color:var(--ink)">${rep.points}</b> (${(rep.points/b.totalPoints*100).toFixed(0)}%)${b.reps.length>1?`, брик делят ${b.reps.length} МП`:''}.</div>
+        <div class="bar-row"><div class="lbl">Высокий потенциал</div><div class="track"><div class="fill" style="width:${b.potHigh/b.totalPoints*100}%;background:var(--a)"></div></div><div class="val">${b.potHigh}</div></div>
+        <div class="bar-row"><div class="lbl">Средний потенциал</div><div class="track"><div class="fill" style="width:${b.potMed/b.totalPoints*100}%;background:var(--b)"></div></div><div class="val">${b.potMed}</div></div>
+        <div class="bar-row"><div class="lbl">Низкий потенциал</div><div class="track"><div class="fill" style="width:${b.potLow/b.totalPoints*100}%;background:var(--d)"></div></div><div class="val">${b.potLow}</div></div>
+        ${b.highPotNotTargeted>0?`<div class="note" style="margin-top:10px"><b>⚠</b> На брике ${b.highPotNotTargeted} точек с высоким потенциалом вне целевого списка (не обязательно ваши — брик может делиться между МП).</div>`:''}
+      `).join('') || '<div class="hint">Брик не определён</div>'}
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Сравнение с коллегами</h2>
+    <div class="card">
+      <div class="hint">Топ-15 МП по суммарным продажам Q1+Q2. ${!inTop15?`Вы не входите в топ‑15 — ваша позиция: ${rep.salesPct} перцентиль.`:''}</div>
+      ${leaderboard.map(r=>`
+        <div class="bar-row">
+          <div class="lbl" style="${r.mp===rep.mp?'font-weight:700;color:var(--teal-dk)':''}">${r.mp}${r.mp===rep.mp?' (вы)':''}</div>
+          <div class="track"><div class="fill" style="width:${r.salesTotal/maxSales*100}%;background:${r.mp===rep.mp?'var(--teal)':'var(--d)'}"></div></div>
+          <div class="val">${fmtRub(r.salesTotal)}</div>
+        </div>`).join('')}
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Мои точки</h2>
+    <div class="tbl-wrap"><div style="max-height:480px;overflow:auto"><table>
+      <thead><tr><th>Точка</th><th>Город</th><th>Сеть</th><th>Потенциал</th><th>Целевая Q3</th><th>Визит</th><th>Продажи Q1+Q2</th></tr></thead>
+      <tbody>
+        ${ownPoints.sort((a,b)=>(b.sQ1+b.sQ2)-(a.sQ1+a.sQ2)).map(p=>`
+        <tr>
+          <td class="addr-cell"><div class="addr-main">${p.org}</div><div class="addr-sub">${p.addr}</div></td>
+          <td>${titleCase(p.city)}</td>
+          <td>${p.net?`<span class="net-badge">${p.net}</span>`:'—'}</td>
+          <td><span class="net-badge" style="background:${p.pot==='Высокий'?'var(--a-tint)':p.pot==='Средний'?'var(--b-tint)':'var(--d-tint)'};color:${p.pot==='Высокий'?'var(--a)':p.pot==='Средний'?'var(--b)':'var(--muted)'}">${p.pot}</span></td>
+          <td>${p.tQ3?'✓':'—'}</td>
+          <td>${p.visited?'✓':(p.tQ3?'<span style="color:var(--danger)">пропущен</span>':'—')}</td>
+          <td class="mono">${fmtRub(p.sQ1+p.sQ2)}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table></div></div>
+  </div>
+  <footer class="credit">Данные периода Q1–Q2 2025 из файла «Модель сегментации SFE Q3'25» — учебный/исторический срез, не текущие продажи. Сопоставление с переписью «Ядран» 1кв.2026 выполнено по точному ID точки (RNC), совпало ${points.filter(p=>p.cScore!=null).length} из ${points.length} закреплённых точек.</footer>
+  `;
 }
 
 /* ============================================================
@@ -718,6 +937,14 @@ function downloadCsv(content, filename){
    EVENT HANDLERS PER TAB
 ============================================================ */
 function attachHandlersFor(tab){
+  if(tab==='myrep'){
+    const sel = document.getElementById('mpSelect');
+    if(sel) sel.addEventListener('change', e=>{
+      state.mp.selected = e.target.value;
+      localStorage.setItem('sfe_selected_mp', state.mp.selected);
+      render();
+    });
+  }
   if(tab==='overview'){
     document.getElementById('ovBody').innerHTML = filteredSortedSet().map(ovRowHtml).join('');
     document.getElementById('qSearch').addEventListener('input', e=>{ state.filter.q = e.target.value; document.getElementById('ovBody').innerHTML = filteredSortedSet().map(ovRowHtml).join(''); bindRowChecks(); });
